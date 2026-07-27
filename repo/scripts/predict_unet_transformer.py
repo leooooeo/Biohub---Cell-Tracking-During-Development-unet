@@ -68,6 +68,15 @@ class PredictConfig:
     det_threshold: float = 0.5
     det_tta: bool = True  # flip-xy TTA for detection logits
     pool_kernel_um: float = 3.0  # max-pool kernel size in µm for detection peak extraction
+    # Sub-voxel peak localisation. The detection grid is downsampled (e.g.
+    # (1, 4, 4)), so an integer argmax quantises X/Y positions to the
+    # downsample step (~1.6 µm in original space here). Refining each peak to
+    # the softmax(logit)-weighted centroid of its local neighbourhood recovers
+    # sub-voxel accuracy, which matters for any distance-gated matching metric
+    # and for every physical-distance gate in downstream graph repair.
+    subvoxel: bool = False
+    subvoxel_radius: int = 1  # neighbourhood half-width (voxels) on the downsampled grid
+    subvoxel_temperature: float = 1.0  # softmax temperature over raw logits
     # Edge filtering
     edge_activation: str = "softmax"  # "sigmoid" or "softmax"
     threshold: float = 0.5
@@ -251,11 +260,62 @@ def pool_kernel_from_um(
     return tuple(kernel)
 
 
+def _subvoxel_offsets(
+    logits: torch.Tensor,
+    peak_idx: torch.Tensor,
+    radius: int,
+    temperature: float,
+) -> torch.Tensor:
+    """Softmax(logit)-weighted centroid offset for each peak.
+
+    For every peak we look at the ``(2*radius+1)^3`` neighbourhood on the
+    downsampled grid, weight each voxel by ``softmax(logit / temperature)``,
+    and return the weighted mean displacement from the peak. Raw logits are
+    used rather than sigmoid probabilities because the detector saturates
+    (neighbouring sigmoids all ≈ 1), which would erase the sub-voxel signal.
+    Out-of-volume neighbours get zero weight, so border peaks are unbiased.
+
+    Parameters
+    ----------
+    logits : torch.Tensor
+        (Z, Y, X) raw detection logits.
+    peak_idx : torch.Tensor
+        (N, 3) integer peak coordinates (z, y, x).
+    radius : int
+        Neighbourhood half-width in voxels.
+    temperature : float
+        Softmax temperature applied to the raw logits.
+
+    Returns
+    -------
+    torch.Tensor
+        (N, 3) float displacements, each bounded to ``[-radius, radius]``.
+    """
+    Z, Y, X = logits.shape
+    offs = torch.arange(-radius, radius + 1, device=logits.device)
+    dz, dy, dx = torch.meshgrid(offs, offs, offs, indexing="ij")
+    disp = torch.stack([dz.reshape(-1), dy.reshape(-1), dx.reshape(-1)], dim=1)  # (K, 3)
+
+    neigh = peak_idx[:, None, :] + disp[None, :, :]  # (N, K, 3)
+    zz, yy, xx = neigh[..., 0], neigh[..., 1], neigh[..., 2]
+    in_bounds = (
+        (zz >= 0) & (zz < Z) & (yy >= 0) & (yy < Y) & (xx >= 0) & (xx < X)
+    )  # (N, K)
+
+    vals = logits[zz.clamp(0, Z - 1), yy.clamp(0, Y - 1), xx.clamp(0, X - 1)]  # (N, K)
+    vals = vals.float().masked_fill(~in_bounds, float("-inf"))
+    weights = torch.softmax(vals / temperature, dim=1)  # (N, K)
+    return weights @ disp.float()  # (N, 3)
+
+
 def _detect_cells_pooled(
     det_logits: torch.Tensor,
     t: int,
     det_threshold: float = 0.5,
     pool_kernel: tuple[int, ...] = (3, 3, 3),
+    subvoxel: bool = False,
+    subvoxel_radius: int = 1,
+    subvoxel_temperature: float = 1.0,
 ) -> np.ndarray:
     """Extract cell coordinates via max-pool local-max (same as training).
 
@@ -273,11 +333,19 @@ def _detect_cells_pooled(
     pool_kernel : tuple[int, ...]
         Per-axis kernel size for local-max pooling,
         e.g. ``(3, 11, 11)`` for anisotropic data.
+    subvoxel : bool
+        If True, refine each integer peak to the softmax(logit)-weighted
+        centroid of its neighbourhood, yielding fractional coordinates.
+    subvoxel_radius : int
+        Neighbourhood half-width in voxels for the centroid.
+    subvoxel_temperature : float
+        Softmax temperature applied to the raw logits for the centroid.
 
     Returns
     -------
     np.ndarray
-        (N, 4) int16 array with columns [t, z, y, x] in downsampled space.
+        (N, 4) float32 array with columns [t, z, y, x] in downsampled space.
+        Coordinates are integer-valued unless ``subvoxel`` is enabled.
     """
     logits = det_logits.unsqueeze(0)  # (1, 1, Z, Y, X)
     pad = tuple(k // 2 for k in pool_kernel)
@@ -286,11 +354,16 @@ def _detect_cells_pooled(
     peak_idx = torch.nonzero(is_peak[0, 0])  # (N, 3)
 
     if peak_idx.shape[0] == 0:
-        return np.empty((0, 4), dtype=np.int16)
+        return np.empty((0, 4), dtype=np.float32)
 
-    coords = peak_idx.float().cpu().numpy()
+    coords = peak_idx.float()
+    if subvoxel and subvoxel_radius > 0:
+        coords = coords + _subvoxel_offsets(
+            logits[0, 0], peak_idx, subvoxel_radius, subvoxel_temperature
+        )
+    coords = coords.cpu().numpy()
     t_col = np.full((len(coords), 1), t, dtype=np.float32)
-    return np.concatenate([t_col, coords], axis=1).astype(np.int16)
+    return np.concatenate([t_col, coords], axis=1).astype(np.float32)
 
 
 @torch.no_grad()
@@ -394,6 +467,9 @@ def predict_video(
             if t not in seen_frames:
                 arr = _detect_cells_pooled(
                     det_logits[f_idx][0], t, cfg.det_threshold, pool_k,
+                    subvoxel=cfg.subvoxel,
+                    subvoxel_radius=cfg.subvoxel_radius,
+                    subvoxel_temperature=cfg.subvoxel_temperature,
                 )
                 coord_offset[t] = (global_node_count, global_node_count + len(arr))
                 global_node_count += len(arr)
@@ -489,11 +565,14 @@ def predict_video(
 
         del unet_out
 
-    coords = np.concatenate(coord_lists) if coord_lists else np.empty((0, 4), dtype=np.int16)
+    coords = np.concatenate(coord_lists) if coord_lists else np.empty((0, 4), dtype=np.float32)
     # Scale spatial coords back to original resolution.
     coords = coords.astype(np.float32)
     coords[:, 1:] *= ds_arr
-    coords = coords.astype(np.int16)
+    # Preserve sub-voxel precision when refinement is on; otherwise keep the
+    # original integer-voxel output so behaviour is unchanged when disabled.
+    if not cfg.subvoxel:
+        coords = coords.astype(np.int16)
     return coords, all_edges
 
 
@@ -643,6 +722,11 @@ def main() -> None:
         slice(*[int(x) if x else None for x in args.slice.split(":")])
         if args.slice else None
     )
+    # Sub-voxel peak localisation is on by default; set
+    # BIOHUB_SUBVOXEL_LOCALIZATION=0 to fall back to integer-voxel peaks (A/B).
+    subvoxel = os.environ.get("BIOHUB_SUBVOXEL_LOCALIZATION", "1") != "0"
+    subvoxel_radius = int(os.environ.get("BIOHUB_SUBVOXEL_RADIUS", "1"))
+    subvoxel_temperature = float(os.environ.get("BIOHUB_SUBVOXEL_TEMPERATURE", "1.0"))
     cfg = PredictConfig(
         det_threshold=args.det_threshold,
         use_ilp=args.use_ilp,
@@ -650,6 +734,9 @@ def main() -> None:
         ilp_appearance_weight=args.ilp_appearance_weight,
         ilp_disappearance_weight=args.ilp_disappearance_weight,
         ilp_division_weight=args.ilp_division_weight,
+        subvoxel=subvoxel,
+        subvoxel_radius=subvoxel_radius,
+        subvoxel_temperature=subvoxel_temperature,
     )
 
     folds = range(5) if args.split == "all" else [int(args.split)]
