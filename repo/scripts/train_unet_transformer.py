@@ -52,22 +52,36 @@ def compute_gt_transition_matrix(
     return matrix
 
 
+# Auxiliary division head hyper-parameters.
+DIV_LOSS_WEIGHT = 0.5   # weight of the division-head BCE relative to edge loss
+DIV_POS_WEIGHT = 5.0    # pos_weight for the (rare) dividing-mother class
+DIV_EDGE_WEIGHT = 1.0   # up-weight edges whose mother divides (1.0 = off; a live knob)
+
+
 def compute_loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """BCE on annotated rows and columns (sparse GT — unannotated cells ignored)."""
-    active_rows = target.sum(dim=1) > 0
-    active_cols = target.sum(dim=0) > 0
-    mask = active_rows.unsqueeze(1) | active_cols.unsqueeze(0)
+    """BCE on annotated rows and columns (sparse GT — unannotated cells ignored).
+
+    New orientation: ``logits``/``target`` are ``(N_t1, N_t)`` — rows are t+1
+    children, columns are t candidate mothers.  Softmax runs over the mother
+    (last) axis so each child forms a distribution over its candidate mothers:
+    one mother per child (merges forbidden), a mother may be shared by several
+    children (divisions allowed).
+    """
+    active_child = target.sum(dim=1) > 0    # t+1 children that have a GT mother
+    active_mother = target.sum(dim=0) > 0   # t mothers that have ≥1 GT child
+    mask = active_child.unsqueeze(1) | active_mother.unsqueeze(0)
     if not mask.any():
         return torch.tensor(0.0, requires_grad=True, device=logits.device)
 
-    probs = torch.softmax(logits, dim=0)  # dim=0 intentional: divisions allowed, merges aren't
+    probs = torch.softmax(logits, dim=1)  # dim=1 (mother axis): divisions allowed, merges aren't
     bce = F.binary_cross_entropy(probs, target, reduction="none")
     p_t = probs * target + (1 - probs) * (1 - target)
     loss = ((1 - p_t) ** 2) * bce
 
-    div_rows = target.sum(dim=1) > 1
+    # Up-weight edges belonging to a dividing mother (a mother column with >1 child).
+    div_mothers = target.sum(dim=0) > 1  # (N_t,)
     weight = torch.ones_like(loss)
-    weight[div_rows] = 1.0
+    weight[:, div_mothers] = DIV_EDGE_WEIGHT
 
     return (loss * weight)[mask].mean()
 
@@ -78,13 +92,61 @@ def compute_batch_loss(
     mask_t: torch.Tensor,
     mask_t1: torch.Tensor,
 ) -> torch.Tensor:
-    """Compute loss over a batch by slicing out real (unpadded) regions."""
+    """Compute loss over a batch by slicing out real (unpadded) regions.
+
+    ``logits``/``target`` are ``(B, N_t1, N_t)``: rows are t+1 children (mask_t1),
+    columns are t candidate mothers (mask_t).
+    """
     B = logits.shape[0]
     losses = []
     for b in range(B):
         nt = mask_t[b].sum().item()
         nt1 = mask_t1[b].sum().item()
-        losses.append(compute_loss(logits[b, :nt, :nt1], target[b, :nt, :nt1]))
+        losses.append(compute_loss(logits[b, :nt1, :nt], target[b, :nt1, :nt]))
+    return torch.stack(losses).mean()
+
+
+def compute_batch_division_loss(
+    div_logits: torch.Tensor,
+    target: torch.Tensor,
+    mask_t: torch.Tensor,
+    mask_t1: torch.Tensor,
+) -> torch.Tensor:
+    """BCE for the auxiliary division head over annotated mothers.
+
+    Parameters
+    ----------
+    div_logits : torch.Tensor
+        ``(B, N_t)`` per t-node "this cell divides" logits.
+    target : torch.Tensor
+        ``(B, N_t1, N_t)`` edge targets (rows t+1 children, cols t mothers).
+    mask_t, mask_t1 : torch.Tensor
+        Boolean masks for real t / t+1 nodes.
+
+    Only mothers with at least one annotated child are supervised (sparse GT).
+    A mother is a positive if it has more than one child in the GT matrix.
+    """
+    B = div_logits.shape[0]
+    pos_weight = torch.tensor(DIV_POS_WEIGHT, device=div_logits.device)
+    losses = []
+    for b in range(B):
+        nt = int(mask_t[b].sum().item())
+        nt1 = int(mask_t1[b].sum().item())
+        if nt == 0 or nt1 == 0:
+            continue
+        tb = target[b, :nt1, :nt]         # (nt1, nt)
+        children_per_mother = tb.sum(dim=0)  # (nt,)
+        supervised = children_per_mother > 0
+        if not supervised.any():
+            continue
+        div_label = (children_per_mother > 1).float()
+        losses.append(F.binary_cross_entropy_with_logits(
+            div_logits[b, :nt][supervised],
+            div_label[supervised],
+            pos_weight=pos_weight,
+        ))
+    if not losses:
+        return torch.tensor(0.0, requires_grad=True, device=div_logits.device)
     return torch.stack(losses).mean()
 
 
@@ -92,17 +154,20 @@ def _evaluate_pair(
     logits: torch.Tensor,
     target: torch.Tensor,
 ) -> tuple[float, int, int]:
-    """Per-pair evaluation. Returns (loss, correct, total)."""
-    active_rows = target.sum(dim=1) > 0
-    active_cols = target.sum(dim=0) > 0
-    if not active_rows.any():
+    """Per-pair evaluation. Returns (loss, correct, total).
+
+    ``logits``/``target`` are ``(N_t1, N_t)`` (rows t+1 children, cols t mothers).
+    """
+    active_child = target.sum(dim=1) > 0
+    active_mother = target.sum(dim=0) > 0
+    if not active_child.any():
         return 0.0, 0, 0
 
     loss = compute_loss(logits, target).item()
-    probs = torch.softmax(logits, dim=0)
+    probs = torch.softmax(logits, dim=1)  # over mother axis
     preds = (probs > 0.5).float()
 
-    mask = active_rows.unsqueeze(1) | active_cols.unsqueeze(0)
+    mask = active_child.unsqueeze(1) | active_mother.unsqueeze(0)
     correct = (preds[mask] == target[mask]).sum().item()
     total = mask.sum().item()
 
@@ -513,8 +578,13 @@ class UNetNodeTransformer(nn.Module):
         pos_feat_tgt: torch.Tensor,   # (B, N_tgt, pos_feat_dim)
         mask_src: torch.Tensor,       # (B, N_src) bool
         mask_tgt: torch.Tensor,       # (B, N_tgt) bool
-    ) -> torch.Tensor:
-        """Run transformer edge predictor on pre-indexed UNet features."""
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run transformer edge predictor on pre-indexed UNet features.
+
+        Returns ``(edge_logits, div_logits)`` where *edge_logits* is
+        ``(B, N_tgt, N_src)`` (rows t+1 children, cols t candidate mothers) and
+        *div_logits* is ``(B, N_src)`` per t-node division logits.
+        """
         feat_src = torch.cat([unet_feat_src, pos_feat_src], dim=-1)
         feat_tgt = torch.cat([unet_feat_tgt, pos_feat_tgt], dim=-1)
         return self.transformer(feat_src, feat_tgt, coords_src, coords_tgt, mask_src, mask_tgt)
@@ -751,10 +821,14 @@ def build_matched_edge_targets(
     max_det_t: int,
     max_det_t1: int,
 ) -> torch.Tensor:
-    """Build (B, max_det_t, max_det_t1) edge targets via vectorised indexing."""
+    """Build (B, max_det_t1, max_det_t) edge targets via vectorised indexing.
+
+    Output orientation matches the transformer: rows are t+1 detections
+    (children), columns are t detections (candidate mothers).
+    """
     B = gt_target.shape[0]
     device = gt_target.device
-    target = torch.zeros(B, max_det_t, max_det_t1, device=device)
+    target = torch.zeros(B, max_det_t1, max_det_t, device=device)
 
     for b in range(B):
         mt = match_t[b]                                 # (n_det_t,)
@@ -766,11 +840,13 @@ def build_matched_edge_targets(
 
         valid_t = mt >= 0
         valid_t1 = mt1 >= 0
-        valid_mask = valid_t.unsqueeze(1) & valid_t1.unsqueeze(0)  # (n_t, n_t1)
+        # (n_t1, n_t): rows t+1 children, cols t mothers.
+        valid_mask = valid_t1.unsqueeze(1) & valid_t.unsqueeze(0)
         safe_t = mt.clamp(min=0)
         safe_t1 = mt1.clamp(min=0)
-        block = gt_trans[safe_t][:, safe_t1] * valid_mask.float()
-        target[b, :n_t, :n_t1] = block
+        # gt_trans[safe_t][:, safe_t1] is (n_t, n_t1); transpose to (n_t1, n_t).
+        block = gt_trans[safe_t][:, safe_t1].T * valid_mask.float()
+        target[b, :n_t1, :n_t] = block
 
     return target
 
@@ -788,8 +864,9 @@ def train_epoch(
     det_neg_weight: float = 0.1,
     max_iters: int | None = None,
     pool_kernel_um: float = 5.0,
-) -> tuple[float, float]:
-    """Train for one epoch, return (avg edge loss, avg detection loss).
+    div_loss_weight: float = DIV_LOSS_WEIGHT,
+) -> tuple[float, float, float]:
+    """Train for one epoch, return (avg edge loss, avg detection loss, avg div loss).
 
     When *max_iters* is set, the loader is cycled repeatedly until that many
     iterations have been performed, regardless of dataset size.
@@ -797,6 +874,7 @@ def train_epoch(
     model.train()
     total_edge_loss = 0.0
     total_det_loss = 0.0
+    total_div_loss = 0.0
     n_samples = 0
 
     if max_iters is not None:
@@ -859,6 +937,7 @@ def train_epoch(
 
         # --- 4. Per-pair edge prediction and loss -------------------------
         block_losses = []
+        div_block_losses = []
         for i in range(W - 1):
             ns = frame_det[i][0].shape[1]
             nt = frame_det[i + 1][0].shape[1]
@@ -866,7 +945,7 @@ def train_epoch(
                 frame_det[i][3], frame_det[i + 1][3],
                 targets[:, i], ns, nt,
             )
-            edge_logits = model.predict_edges(
+            edge_logits, div_logits = model.predict_edges(
                 frame_det[i][4], frame_det[i + 1][4],
                 frame_det[i][0] * ds_scale, frame_det[i + 1][0] * ds_scale,
                 frame_det[i][1], frame_det[i + 1][1],
@@ -876,10 +955,15 @@ def train_epoch(
                 edge_logits, pair_target,
                 frame_det[i][2], frame_det[i + 1][2],
             ))
+            div_block_losses.append(compute_batch_division_loss(
+                div_logits, pair_target,
+                frame_det[i][2], frame_det[i + 1][2],
+            ))
         edge_loss = sum(block_losses) / len(block_losses)
+        div_loss = sum(div_block_losses) / len(div_block_losses)
 
         # --- 5. Combined loss -----------------------------------------------
-        loss = edge_loss + det_loss_weight * det_loss
+        loss = edge_loss + det_loss_weight * det_loss + div_loss_weight * div_loss
 
         torch.cuda.synchronize()
         t2 = time.perf_counter()
@@ -896,6 +980,7 @@ def train_epoch(
 
         total_edge_loss += edge_loss.item() * B
         total_det_loss += det_loss.item() * B
+        total_div_loss += div_loss.item() * B
         n_samples += B
 
         t0 = time.perf_counter()
@@ -912,6 +997,7 @@ def train_epoch(
     return (
         total_edge_loss / max(n_samples, 1),
         total_det_loss / max(n_samples, 1),
+        total_div_loss / max(n_samples, 1),
     )
 
 
@@ -972,7 +1058,7 @@ def evaluate(
                 frame_det[i][3], frame_det[i + 1][3],
                 targets[:, i], ns, nt,
             )
-            pair_logits = model.predict_edges(
+            pair_logits, _pair_div = model.predict_edges(
                 frame_det[i][4], frame_det[i + 1][4],
                 frame_det[i][0] * ds_scale, frame_det[i + 1][0] * ds_scale,
                 frame_det[i][1], frame_det[i + 1][1],
@@ -980,10 +1066,10 @@ def evaluate(
             )
 
             for b in range(B):
-                ns_b = int(frame_det[i][2][b].sum().item())
-                nt_b = int(frame_det[i + 1][2][b].sum().item())
+                ns_b = int(frame_det[i][2][b].sum().item())      # t mothers (cols)
+                nt_b = int(frame_det[i + 1][2][b].sum().item())  # t+1 children (rows)
                 pair_loss, pair_correct, pair_total = _evaluate_pair(
-                    pair_logits[b, :ns_b, :nt_b], pair_target[b, :ns_b, :nt_b],
+                    pair_logits[b, :nt_b, :ns_b], pair_target[b, :nt_b, :ns_b],
                 )
                 total_loss += pair_loss
                 correct += pair_correct
@@ -1152,7 +1238,7 @@ def train(
 
     for epoch in pbar:
         t0 = time.monotonic()
-        edge_loss, det_loss = train_epoch(
+        edge_loss, det_loss, div_loss = train_epoch(
             model, train_loader, optimizer, device, det_loss_weight, det_neg_weight,
             max_iters=max_iters, pool_kernel_um=pool_kernel_um,
         )
@@ -1175,9 +1261,9 @@ def train(
             )
 
         marker = "*" if is_best else " "
-        pbar.set_postfix(edge=f"{edge_loss:.4f}", det=f"{det_loss:.4f}", acc=f"{test_acc:.4f}")
+        pbar.set_postfix(edge=f"{edge_loss:.4f}", det=f"{det_loss:.4f}", div=f"{div_loss:.4f}", acc=f"{test_acc:.4f}")
         print(
-            f"  Epoch {epoch:3d}/{n_epochs} | edge={edge_loss:.4f} | det={det_loss:.4f} | "
+            f"  Epoch {epoch:3d}/{n_epochs} | edge={edge_loss:.4f} | det={det_loss:.4f} | div={div_loss:.4f} | "
             f"test_loss={test_loss:.4f} | acc={test_acc:.4f} | recall={test_recall:.4f} | best={best_score:.4f} {marker} | "
             f"train={train_time:.1f}s test={test_time:.1f}s",
             flush=True,
