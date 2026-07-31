@@ -74,9 +74,14 @@ class SimpleNodeTransformer(nn.Module):
         mlp_ratio: float = 2.0,
         dropout: float = 0.3,
         pair_chunk_size: int | None = 32,
+        use_checkpoint: bool = True,
     ):
         super().__init__()
         self.pair_chunk_size = pair_chunk_size
+        # Gradient checkpointing trades compute for memory. It was essential when
+        # the UNet shared the graph; for transformer-only (frozen UNet) training
+        # there is memory headroom, so it can be disabled for a speedup.
+        self.use_checkpoint = use_checkpoint
         self.proj = nn.Linear(feat_dim, hidden_dim)
         self.norm_in = nn.LayerNorm(hidden_dim)
 
@@ -173,7 +178,7 @@ class SimpleNodeTransformer(nn.Module):
             ) -> torch.Tensor:
                 return _b(k, kv, kv_mask=mask)
 
-            if torch.is_grad_enabled():
+            if self.use_checkpoint and torch.is_grad_enabled():
                 q = grad_ckpt(_q_fn, q, k, mask_k, use_reentrant=False)
                 k = grad_ckpt(_k_fn, k, q, mask_q, use_reentrant=False)
             else:
@@ -213,7 +218,7 @@ class SimpleNodeTransformer(nn.Module):
                 rel = (cc_q.unsqueeze(2) - cc_k.unsqueeze(1)) / 100.0
                 return _pm(torch.cat([qe, ke, rel], dim=-1)).squeeze(-1)
 
-            if torch.is_grad_enabled():
+            if self.use_checkpoint and torch.is_grad_enabled():
                 out = grad_ckpt(
                     _chunk_fn, q_c, k, coords_c, coords_t, use_reentrant=False
                 )

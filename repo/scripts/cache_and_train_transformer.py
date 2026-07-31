@@ -150,6 +150,7 @@ def cache_split(
     config: dict,
     device: torch.device,
     pool_kernel_um: float,
+    det_threshold: float,
     max_frames: int | None,
     force: bool,
 ) -> int:
@@ -193,7 +194,7 @@ def cache_split(
                 det_c, det_p, det_m, matches = detect_and_match(
                     det_logits[i], coords[:, i], masks[:, i],
                     image_shape, voxel_size=voxel_size,
-                    pool_kernel_um=pool_kernel_um,
+                    pool_kernel_um=pool_kernel_um, det_threshold=det_threshold,
                     frame_index=i, window_size=W,
                 )
                 unet_feat = model._index_features(unet_out[:, i], det_c, det_m)
@@ -314,6 +315,8 @@ def train_transformer(
     num_workers: int,
     div_loss_weight: float,
     seed: int,
+    use_amp: bool = True,
+    use_checkpoint: bool = False,
 ) -> None:
     torch.manual_seed(seed)
     train_ds = CachedPairDataset(train_cache)
@@ -335,11 +338,14 @@ def train_transformer(
     transformer = SimpleNodeTransformer(
         feat_dim=config["unet_out_channels"] + 4 * _POS_EMBED_DIM,
         hidden_dim=128, n_heads=4, n_blocks=4, dropout=0.3,
+        use_checkpoint=use_checkpoint,
     ).to(device)
     n_params = sum(p.numel() for p in transformer.parameters())
-    print(f"Transformer params: {n_params:,}", flush=True)
+    amp_on = use_amp and device.type == "cuda"
+    print(f"Transformer params: {n_params:,} | amp={amp_on} | grad_checkpoint={use_checkpoint}", flush=True)
 
     optimizer = torch.optim.AdamW(transformer.parameters(), lr=lr)
+    scaler = torch.cuda.amp.GradScaler(enabled=amp_on)
 
     # Encoder weights to splice into the saved checkpoint (kept on CPU).
     shipped = torch.load(shipped_weights, map_location="cpu", weights_only=True)
@@ -359,49 +365,71 @@ def train_transformer(
         total, n = 0.0, 0
         for batch in train_loader:
             b = _to_device(batch, device)
-            edge_logits, div_logits = transformer(
-                b["feat_t"], b["feat_t1"], b["coords_t"], b["coords_t1"],
-                b["mask_t"], b["mask_t1"],
-            )
+            with torch.autocast(device_type=device.type, enabled=amp_on):
+                edge_logits, div_logits = transformer(
+                    b["feat_t"], b["feat_t1"], b["coords_t"], b["coords_t1"],
+                    b["mask_t"], b["mask_t1"],
+                )
+            # Losses in fp32 (binary_cross_entropy is autocast-unsafe).
+            edge_logits = edge_logits.float()
+            div_logits = div_logits.float()
             edge_loss = compute_batch_loss(edge_logits, b["target"], b["mask_t"], b["mask_t1"])
             div_loss = compute_batch_division_loss(div_logits, b["target"], b["mask_t"], b["mask_t1"])
             loss = edge_loss + div_loss_weight * div_loss
             optimizer.zero_grad()
-            loss.backward()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(transformer.parameters(), 1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             total += loss.item() * b["feat_t"].shape[0]
             n += b["feat_t"].shape[0]
         train_loss = total / max(n, 1)
 
-        # Validation: edge accuracy (same metric family as the main script).
+        # Validation: positive-edge precision/recall/F1 (meaningful under the
+        # extreme class imbalance) plus the legacy pairwise accuracy.
         transformer.eval()
         correct, tot = 0, 0
+        tp = fp = fn = 0
         with torch.no_grad():
             for batch in val_loader:
                 b = _to_device(batch, device)
-                edge_logits, _ = transformer(
-                    b["feat_t"], b["feat_t1"], b["coords_t"], b["coords_t1"],
-                    b["mask_t"], b["mask_t1"],
-                )
+                with torch.autocast(device_type=device.type, enabled=amp_on):
+                    edge_logits, _ = transformer(
+                        b["feat_t"], b["feat_t1"], b["coords_t"], b["coords_t1"],
+                        b["mask_t"], b["mask_t1"],
+                    )
+                edge_logits = edge_logits.float()
                 for i in range(b["feat_t"].shape[0]):
                     nt = int(b["mask_t"][i].sum()); nt1 = int(b["mask_t1"][i].sum())
-                    _, c, t = _evaluate_pair(
-                        edge_logits[i, :nt1, :nt], b["target"][i, :nt1, :nt])
+                    lg = edge_logits[i, :nt1, :nt]
+                    tg = b["target"][i, :nt1, :nt]
+                    _, c, t = _evaluate_pair(lg, tg)
                     correct += c; tot += t
+                    # Positive-edge stats over the annotated submatrix.
+                    active = (tg.sum(dim=1, keepdim=True) > 0) | (tg.sum(dim=0, keepdim=True) > 0)
+                    pred = (torch.softmax(lg, dim=1) > 0.5) & active
+                    gt = tg > 0.5
+                    tp += int((pred & gt).sum())
+                    fp += int((pred & ~gt).sum())
+                    fn += int((~pred & gt).sum())
         val_acc = correct / max(tot, 1)
+        prec = tp / max(tp + fp, 1)
+        rec = tp / max(tp + fn, 1)
+        f1 = 2 * prec * rec / max(prec + rec, 1e-9)
 
-        is_best = val_acc >= best_score
+        is_best = f1 >= best_score
         if is_best:
-            best_score = val_acc
+            best_score = f1
             full = {**enc_state,
                     **{f"transformer.{k}": v for k, v in transformer.state_dict().items()}}
             torch.save(full, save_path)
         print(f"  Epoch {epoch:3d}/{epochs} | train_loss={train_loss:.4f} | "
-              f"val_acc={val_acc:.4f} | best={best_score:.4f} {'*' if is_best else ' '} | "
+              f"val_F1={f1:.4f} (P={prec:.3f} R={rec:.3f}) | val_acc={val_acc:.4f} | "
+              f"bestF1={best_score:.4f} {'*' if is_best else ' '} | "
               f"{time.monotonic()-t0:.1f}s", flush=True)
 
-    print(f"\nBest val_acc={best_score:.4f}, saved full checkpoint to {save_path}", flush=True)
+    print(f"\nBest val_F1={best_score:.4f}, saved full checkpoint to {save_path}", flush=True)
 
 
 # =============================================================================
@@ -432,6 +460,15 @@ def main() -> None:
                         "(no fork-copy) is usually best; caching I/O uses a fixed 2 internally.")
     p.add_argument("--div-loss-weight", type=float, default=DIV_LOSS_WEIGHT)
     p.add_argument("--pool-kernel-um", type=float, default=5.0)
+    p.add_argument("--det-threshold", type=float, default=0.3,
+                   help="Detection logit threshold at cache time. Higher = fewer "
+                        "candidate nodes = much smaller N² pair matrices = faster "
+                        "(at some cost to negative/GT-match coverage). Default 0.3.")
+    p.add_argument("--no-amp", dest="amp", action="store_false", default=True,
+                   help="Disable mixed-precision (AMP) training.")
+    p.add_argument("--grad-checkpoint", action="store_true",
+                   help="Enable gradient checkpointing in the transformer (slower but "
+                        "lower memory). Off by default for frozen-UNet training.")
     p.add_argument("--max-frames", type=int, default=None, help="Cap frames per video (smoke test)")
     p.add_argument("--seed", type=int, default=314159)
     p.add_argument("--force-recache", action="store_true")
@@ -473,10 +510,10 @@ def main() -> None:
 
     if args.phase in ("cache", "all"):
         model = load_frozen_encoder(shipped_weights, config, device)
-        n_tr = cache_split(model, train_names, data_dir, train_cache, config,
-                           device, args.pool_kernel_um, args.max_frames, args.force_recache)
-        n_va = cache_split(model, val_names, data_dir, val_cache, config,
-                           device, args.pool_kernel_um, args.max_frames, args.force_recache)
+        n_tr = cache_split(model, train_names, data_dir, train_cache, config, device,
+                           args.pool_kernel_um, args.det_threshold, args.max_frames, args.force_recache)
+        n_va = cache_split(model, val_names, data_dir, val_cache, config, device,
+                           args.pool_kernel_um, args.det_threshold, args.max_frames, args.force_recache)
         print(f"Cached {n_tr} train + {n_va} val pairs into {cache_root}", flush=True)
         del model
         if device.type == "cuda":
@@ -487,7 +524,7 @@ def main() -> None:
             train_cache, val_cache, config, out_dir, shipped_weights, device,
             epochs=args.epochs, lr=args.lr, batch_size=args.batch_size,
             num_workers=args.num_workers, div_loss_weight=args.div_loss_weight,
-            seed=args.seed,
+            seed=args.seed, use_amp=args.amp, use_checkpoint=args.grad_checkpoint,
         )
 
 
