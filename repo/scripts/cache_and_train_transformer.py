@@ -440,8 +440,16 @@ def main() -> None:
     repo_root = Path(__file__).resolve().parent.parent
     data_dir = Path(args.data_dir) if args.data_dir else Path(DATASET_PATH)
     splits_file = Path(args.splits) if args.splits else None
-    shipped_weights = Path(args.shipped_weights) if args.shipped_weights else (
-        WEIGHTS_PATH / "unet_transformer" / "split_0" / "edge_predictor_best.pth")
+
+    # The shipped weights may sit under repo/weights (dataspec) or at the git
+    # root's weights/ (the checked-in layout). Search both unless overridden.
+    if args.shipped_weights:
+        shipped_weights = Path(args.shipped_weights)
+    else:
+        rel = Path("unet_transformer/split_0/edge_predictor_best.pth")
+        roots = [WEIGHTS_PATH, repo_root.parent / "weights"]
+        shipped_weights = next(
+            (r / rel for r in roots if (r / rel).exists()), roots[0] / rel)
     cache_root = Path(args.cache_dir) if args.cache_dir else (repo_root / "cache" / "unet_feats")
     out_dir = Path(args.out_dir) if args.out_dir else (
         WEIGHTS_PATH / "unet_transformer_frozen" / f"split_{args.fold}")
