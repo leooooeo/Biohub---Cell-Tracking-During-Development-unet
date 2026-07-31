@@ -45,8 +45,10 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-# Sibling imports (this file lives next to train_unet_transformer.py).
+# Make sibling scripts and the src package importable without an install step.
+# This file lives at repo/scripts/; the package is at repo/src/biohub_tracking.
 sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from train_unet_transformer import (  # noqa: E402
     DIV_LOSS_WEIGHT,
