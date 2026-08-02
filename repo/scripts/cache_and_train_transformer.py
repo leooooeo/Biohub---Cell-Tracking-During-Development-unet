@@ -316,7 +316,7 @@ def train_transformer(
     div_loss_weight: float,
     seed: int,
     use_amp: bool = True,
-    use_checkpoint: bool = False,
+    use_checkpoint: bool = True,
 ) -> None:
     torch.manual_seed(seed)
     train_ds = CachedPairDataset(train_cache)
@@ -345,7 +345,7 @@ def train_transformer(
     print(f"Transformer params: {n_params:,} | amp={amp_on} | grad_checkpoint={use_checkpoint}", flush=True)
 
     optimizer = torch.optim.AdamW(transformer.parameters(), lr=lr)
-    scaler = torch.cuda.amp.GradScaler(enabled=amp_on)
+    scaler = torch.amp.GradScaler(device.type, enabled=amp_on)
 
     # Encoder weights to splice into the saved checkpoint (kept on CPU).
     shipped = torch.load(shipped_weights, map_location="cpu", weights_only=True)
@@ -466,9 +466,10 @@ def main() -> None:
                         "(at some cost to negative/GT-match coverage). Default 0.3.")
     p.add_argument("--no-amp", dest="amp", action="store_false", default=True,
                    help="Disable mixed-precision (AMP) training.")
-    p.add_argument("--grad-checkpoint", action="store_true",
-                   help="Enable gradient checkpointing in the transformer (slower but "
-                        "lower memory). Off by default for frozen-UNet training.")
+    p.add_argument("--no-grad-checkpoint", dest="grad_checkpoint", action="store_false", default=True,
+                   help="Disable gradient checkpointing in the transformer (faster but "
+                        "much higher memory). On by default — keep it on for 16 GB GPUs "
+                        "like the Colab T4; only turn off on large-VRAM GPUs.")
     p.add_argument("--max-frames", type=int, default=None, help="Cap frames per video (smoke test)")
     p.add_argument("--seed", type=int, default=314159)
     p.add_argument("--force-recache", action="store_true")
