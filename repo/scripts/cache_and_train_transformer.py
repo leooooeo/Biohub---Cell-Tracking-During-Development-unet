@@ -439,7 +439,9 @@ def train_transformer(
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--phase", choices=["cache", "train", "all"], default="all")
+    p.add_argument("--phase", choices=["cache", "train", "all", "splits"], default="all",
+                   help="'splits' only writes the auto train/val split JSON and exits "
+                        "(no caching, no training) so predict can evaluate on the same val set.")
     p.add_argument("--data-dir", type=str, default=None, help="Default: $BIOHUB_DATA_DIR / dataspec")
     p.add_argument("--splits", type=str, default=None, help="Optional dataset_splits.json")
     p.add_argument("--fold", type=int, default=0)
@@ -506,6 +508,20 @@ def main() -> None:
 
     train_names, val_names = resolve_splits(
         data_dir, splits_file, args.fold, args.val_frac, args.seed)
+
+    # Persist the (auto) split so predict_unet_transformer.py can evaluate on the
+    # exact same val videos: pass --splits <this file> --split 0 to that script.
+    if splits_file is None:
+        cache_root.mkdir(parents=True, exist_ok=True)
+        auto_splits = cache_root / "dataset_splits_auto.json"
+        auto_splits.write_text(json.dumps(
+            [{"train": train_names, "test": val_names}], indent=2))
+        print(f"Wrote auto split ({len(train_names)}/{len(val_names)}) to {auto_splits}\n"
+              f"  -> evaluate with: predict_unet_transformer.py --splits {auto_splits} --split 0 --evaluate",
+              flush=True)
+    if args.phase == "splits":
+        return
+
     train_cache = cache_root / "train"
     val_cache = cache_root / "val"
 
