@@ -20,12 +20,16 @@ import torch.nn.functional as F
 import zarr
 from tqdm import tqdm
 
+# Make sibling scripts and the src package importable without an install step
+# (must run before importing biohub_tracking / train_unet_transformer).
+sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
 import tracksdata as td
 
 from biohub_tracking.io import open_dataset, save_graph
 
 # Import model and helpers from companion training script.
-sys.path.insert(0, str(Path(__file__).parent))
 from train_unet_transformer import (
     DEFAULT_METHOD,
     UNetNodeTransformer,
