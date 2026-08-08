@@ -20,12 +20,16 @@ import torch.nn.functional as F
 import zarr
 from tqdm import tqdm
 
+# Make sibling scripts and the src package importable without an install step
+# (must run before importing biohub_tracking / train_unet_transformer).
+sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
 import tracksdata as td
 
 from biohub_tracking.io import open_dataset, save_graph
 
 # Import model and helpers from companion training script.
-sys.path.insert(0, str(Path(__file__).parent))
 from train_unet_transformer import (
     DEFAULT_METHOD,
     UNetNodeTransformer,
@@ -444,18 +448,21 @@ def predict_video(
             unet_feat_tgt = model._index_features(
                 unet_out[:, f_idx + 1], p_coords_tgt, p_mask_tgt,
             )
-            edge_logits_pair = model.predict_edges(
+            edge_logits_pair, _div_logits_pair = model.predict_edges(
                 unet_feat_src, unet_feat_tgt,
                 p_coords_src * ds_arr_t, p_coords_tgt * ds_arr_t,
                 p_pos_src, p_pos_tgt,
                 p_mask_src, p_mask_tgt,
-            )  # (1, n_src, n_tgt)
+            )  # edge_logits_pair: (1, n_tgt, n_src) — rows t+1 children, cols t mothers
 
-            raw = edge_logits_pair[0]
+            # raw[j, i] = score(child j ← mother i). Softmax over the mother axis
+            # normalises each child over its candidate mothers, then transpose to
+            # (n_src, n_tgt) so the greedy assignment below is unchanged.
+            raw = edge_logits_pair[0]  # (n_tgt, n_src)
             if cfg.edge_activation == "softmax":
-                probs = torch.softmax(raw, dim=0).cpu().numpy()
+                probs = torch.softmax(raw, dim=1).T.cpu().numpy()  # (n_src, n_tgt)
             else:
-                probs = torch.sigmoid(raw).cpu().numpy()
+                probs = torch.sigmoid(raw).T.cpu().numpy()  # (n_src, n_tgt)
 
             candidates = sorted(
                 [

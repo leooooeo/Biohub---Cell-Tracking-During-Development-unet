@@ -74,9 +74,14 @@ class SimpleNodeTransformer(nn.Module):
         mlp_ratio: float = 2.0,
         dropout: float = 0.3,
         pair_chunk_size: int | None = 32,
+        use_checkpoint: bool = True,
     ):
         super().__init__()
         self.pair_chunk_size = pair_chunk_size
+        # Gradient checkpointing trades compute for memory. It was essential when
+        # the UNet shared the graph; for transformer-only (frozen UNet) training
+        # there is memory headroom, so it can be disabled for a speedup.
+        self.use_checkpoint = use_checkpoint
         self.proj = nn.Linear(feat_dim, hidden_dim)
         self.norm_in = nn.LayerNorm(hidden_dim)
 
@@ -97,6 +102,10 @@ class SimpleNodeTransformer(nn.Module):
             nn.Linear(hidden_dim // 2, 1),
         )
 
+        # Auxiliary head: predicts, per t-node (candidate mother), whether that
+        # cell divides between t and t+1. Trained with a separate BCE loss.
+        self.div_head = nn.Linear(hidden_dim, 1)
+
     def forward(
         self,
         feat_t: torch.Tensor,
@@ -105,9 +114,17 @@ class SimpleNodeTransformer(nn.Module):
         coords_t1: torch.Tensor,
         mask_t: torch.Tensor | None = None,
         mask_t1: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Predict edge logits between detections at consecutive frames.
+
+        The t+1 nodes act as the attention **query** (the children asking "who is
+        my mother?"); the t nodes are the keys/values (candidate mothers).  The
+        output matrix is oriented as ``(N_t1, N_t)`` — rows are t+1 children,
+        columns are t candidate mothers.  A softmax over the last (mother) axis
+        gives, for each child, a distribution over its candidate mothers
+        (one mother per child; a mother may be shared by up to two children when
+        a division occurs).
 
         Accepts both unbatched (N, D) and batched (B, N, D) inputs.
         When unbatched, a batch dimension is added and removed automatically.
@@ -129,8 +146,10 @@ class SimpleNodeTransformer(nn.Module):
 
         Returns
         -------
-        torch.Tensor
-            Edge logits, shape (N_t, N_t1) or (B, N_t, N_t1).
+        edge_logits : torch.Tensor
+            Edge logits, shape (N_t1, N_t) or (B, N_t1, N_t).
+        div_logits : torch.Tensor
+            Per t-node division logits, shape (N_t,) or (B, N_t).
         """
         unbatched = feat_t.ndim == 2
         if unbatched:
@@ -139,10 +158,13 @@ class SimpleNodeTransformer(nn.Module):
             coords_t = coords_t.unsqueeze(0)
             coords_t1 = coords_t1.unsqueeze(0)
 
-        q = self.norm_in(self.proj(feat_t))   # (B, N_t, hidden)
-        k = self.norm_in(self.proj(feat_t1))  # (B, N_t1, hidden)
+        # Query = t+1 (children); Key/Value = t (candidate mothers).
+        q = self.norm_in(self.proj(feat_t1))  # (B, N_t1, hidden)
+        k = self.norm_in(self.proj(feat_t))   # (B, N_t,  hidden)
+        mask_q = mask_t1  # mask over query (t+1) nodes
+        mask_k = mask_t   # mask over key   (t)   nodes
 
-        # Bi-directional cross-attention: t attends to t+1 and vice versa.
+        # Bi-directional cross-attention: t+1 attends to t and vice versa.
         for block in self.blocks:
             def _q_fn(
                 q: torch.Tensor, kv: torch.Tensor,
@@ -156,55 +178,59 @@ class SimpleNodeTransformer(nn.Module):
             ) -> torch.Tensor:
                 return _b(k, kv, kv_mask=mask)
 
-            if torch.is_grad_enabled():
-                q = grad_ckpt(_q_fn, q, k, mask_t1, use_reentrant=False)
-                k = grad_ckpt(_k_fn, k, q, mask_t, use_reentrant=False)
+            if self.use_checkpoint and torch.is_grad_enabled():
+                q = grad_ckpt(_q_fn, q, k, mask_k, use_reentrant=False)
+                k = grad_ckpt(_k_fn, k, q, mask_q, use_reentrant=False)
             else:
-                q = _q_fn(q, k, mask_t1)
-                k = _k_fn(k, q, mask_t)
+                q = _q_fn(q, k, mask_k)
+                k = _k_fn(k, q, mask_q)
 
-        q = self.norm_out(q)  # (B, N_t, hidden)
-        k = self.norm_out(k)  # (B, N_t1, hidden)
+        q = self.norm_out(q)  # (B, N_t1, hidden) — children
+        k = self.norm_out(k)  # (B, N_t,  hidden) — candidate mothers
 
-        # Build pairwise logits in chunks over N_t to avoid O(N²) peak allocation.
-        # Full tensor (B, N_t, N_t1, 2*hidden+3) can be tens of GB for large N.
-        # Each chunk is grad-checkpointed: forward peak = B×chunk×N_t1×(2H+3),
-        # backward only re-stores tiny q_c / coords slice instead of all activations.
-        N_t = q.shape[1]
-        chunk = self.pair_chunk_size or N_t
+        # Auxiliary division head on the mother (t) node embeddings.
+        div_logits = self.div_head(k).squeeze(-1)  # (B, N_t)
+
+        # Build pairwise logits in chunks over N_t1 (the query axis) to avoid
+        # O(N²) peak allocation. Full tensor (B, N_t1, N_t, 2*hidden+3) can be
+        # tens of GB for large N. Each chunk is grad-checkpointed: forward peak =
+        # B×chunk×N_t×(2H+3), backward only re-stores the tiny q_c / coords slice.
+        N_q = q.shape[1]
+        chunk = self.pair_chunk_size or N_q
         chunks = []
         pair_mlp = self.pair_mlp
 
-        for i in range(0, N_t, chunk):
+        for i in range(0, N_q, chunk):
             q_c = q[:, i : i + chunk, :]
-            coords_c = coords_t[:, i : i + chunk, :]
+            coords_c = coords_t1[:, i : i + chunk, :]  # query coords are t+1
 
             def _chunk_fn(
                 qc: torch.Tensor,
                 kk: torch.Tensor,
-                cc: torch.Tensor,
-                cc1: torch.Tensor,
+                cc_q: torch.Tensor,
+                cc_k: torch.Tensor,
                 _pm: nn.Module = pair_mlp,
             ) -> torch.Tensor:
                 nc_i = qc.shape[1]
-                n1 = kk.shape[1]
-                qe = qc.unsqueeze(2).expand(-1, -1, n1, -1)
+                nk = kk.shape[1]
+                qe = qc.unsqueeze(2).expand(-1, -1, nk, -1)
                 ke = kk.unsqueeze(1).expand(-1, nc_i, -1, -1)
-                rel = (cc.unsqueeze(2) - cc1.unsqueeze(1)) / 100.0
+                rel = (cc_q.unsqueeze(2) - cc_k.unsqueeze(1)) / 100.0
                 return _pm(torch.cat([qe, ke, rel], dim=-1)).squeeze(-1)
 
-            if torch.is_grad_enabled():
+            if self.use_checkpoint and torch.is_grad_enabled():
                 out = grad_ckpt(
-                    _chunk_fn, q_c, k, coords_c, coords_t1, use_reentrant=False
+                    _chunk_fn, q_c, k, coords_c, coords_t, use_reentrant=False
                 )
             else:
-                out = _chunk_fn(q_c, k, coords_c, coords_t1)
+                out = _chunk_fn(q_c, k, coords_c, coords_t)
 
             chunks.append(out)
 
-        logits = torch.cat(chunks, dim=1)  # (B, N_t, N_t1)
+        logits = torch.cat(chunks, dim=1)  # (B, N_t1, N_t)
 
         if unbatched:
             logits = logits.squeeze(0)
+            div_logits = div_logits.squeeze(0)
 
-        return logits
+        return logits, div_logits
